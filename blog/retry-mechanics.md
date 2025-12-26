@@ -4,55 +4,140 @@ Computations crash. This isn't pessimism—it's physics. Memory corrupts. Networ
 
 But here's what's interesting: the *same* program, doing the *same* work, can have dramatically different failure rates depending on how you execute it. This post explores why, with a TypeScript simulation you can run yourself.
 
-## The Inevitability of Failure
+## One Process, Constant Danger
 
-Consider a simple model: your computation has some probability of crashing per unit of time. This follows a Poisson process—random failures occur at a constant average rate. The probability of surviving for duration *t* is:
+Let's start with a simple model. You have a process—a serverless function, a container, a connection. It's running. At every moment, there's some probability it crashes:
+
+- A cosmic ray flips a bit
+- The network hiccups
+- The OOM killer strikes
+- A dependency times out
+
+We model this as a **Poisson process** with rate λ. At any instant, there's a constant hazard rate. The probability of surviving for duration *t* is:
 
 ```
-P(survive) = e^(-λt)
+P(survive t) = e^(-λt)
 ```
 
-Where λ is the failure rate. The longer you run, the lower your survival probability.
+The longer you run, the more you're exposed to danger. More exposure, more chances for something to go wrong.
 
-But there's a harder constraint lurking in most systems: **timeouts**. Serverless functions have execution limits. HTTP requests time out. Kubernetes kills pods that run too long. At some point *t = T*, your survival probability doesn't just decrease—it drops to zero.
+## The Failure Model
 
-This creates an uncomfortable reality: some computations are *structurally impossible* to complete, not because they're too complex, but because they take too long.
+Our simulation uses two failure mechanisms:
 
-## The Checkpointing Insight
+**1. Poisson failures (random crashes)**
 
-What if we could reset the clock?
+The process can fail at any moment. For a time interval of duration *d*, the probability of failure is:
 
-Imagine breaking your computation into discrete steps—let's call them "calls." Each call is atomic: it either completes fully or fails entirely. If we treat each completed call as a checkpoint, we can:
+```
+P(fail during interval d) = 1 - e^(-λd)
+```
 
-1. **Reset the timeout clock** after each call
-2. **Resume from the last checkpoint** on retry, rather than starting over
+This is memoryless—the process doesn't "remember" how long it's been running. Each instant has the same hazard rate. But crucially, **more time means more exposure**, and more exposure means higher cumulative probability of at least one failure.
 
-Same total work. Different execution semantics. But does it actually matter?
+**2. Hard timeout**
 
-Let's find out.
+Many systems have a hard cutoff. Serverless functions have execution limits. HTTP requests time out. At time *T*, your process is killed—no exceptions. This isn't probabilistic; it's certain.
 
-## Building the Simulation
+## Calls Are Atomic
 
-We'll model a program as a sequence of calls, each with a duration:
+Now let's add structure. Your work consists of a sequence of **calls**—discrete units of work:
 
 ```typescript
+type Program = readonly Call[];
+
 interface Call {
   readonly duration: number;
 }
-
-type Program = readonly Call[];
 ```
 
-And a failure configuration with both Poisson failures and hard timeouts:
+Each call is **atomic**: it either completes fully or fails entirely. You cannot checkpoint mid-call. If a failure happens during Call 3, that call's work is lost.
 
-```typescript
-interface FailureConfig {
-  readonly poissonRate: number;  // λ: failure rate per time unit
-  readonly timeout: number;       // Hard cutoff
-}
+```
+|-- Call 1 --|-- Call 2 --|-- Call 3 --|-- Call 4 --|
+0            5            10           15           20
+             ↑            ↑            ↑            ↑
+         checkpoint    checkpoint    checkpoint   checkpoint
+
+If failure at t=12: Calls 1-2 saved, Call 3 lost, resume from Call 3
 ```
 
-The failure check combines both mechanisms:
+This has important implications:
+- **Longer calls = more risk** before the next checkpoint
+- **If any single call exceeds the timeout, the program is impossible** to complete
+- Checkpoint granularity is determined by call boundaries
+
+## Two Execution Modes
+
+Given this model, consider two ways to run the same program:
+
+**Without checkpointing:**
+- On failure, restart from the beginning
+- Timeout applies to total elapsed time
+- Each retry redoes all previous work
+
+**With checkpointing:**
+- On failure, resume from the last completed call
+- Timeout resets after each call
+- Retries only redo the failed call
+
+The key insight: **checkpointing reduces total exposure time**.
+
+```
+Without checkpoint:
+  Attempt 1: 15 units, crash (calls 1-3 lost)
+  Attempt 2: 20 units, crash (calls 1-4 lost)
+  Attempt 3: 50 units, success
+  Total exposure: 85 units
+
+With checkpoint:
+  Attempt 1: 15 units, crash (calls 1-2 saved, call 3 lost)
+  Attempt 2: 35 units, success (only calls 3-10 needed)
+  Total exposure: 50 units
+```
+
+Less total time running = less exposure to failure = fewer crashes along the way.
+
+## The Markov Chain Perspective
+
+Both execution modes form a **Markov chain**. The state is how many calls we've completed. The next state depends only on the current state, not on history.
+
+**With checkpointing** — a ratchet that only moves forward:
+```
+State: 0 → 1 → 2 → 3 → ... → n (success)
+       ↺   ↺   ↺   ↺
+     retry retry retry
+     (stay) (stay) (stay)
+```
+Failure at state *i* → stay at *i*, retry that call.
+
+**Without checkpointing** — any failure resets to zero:
+```
+State: 0 → 1 → 2 → 3 → ... → n (success)
+       ↖___↙ ↖__↙ ↖__↙
+         reset  reset  reset
+```
+Failure at *any* state → back to 0.
+
+Both are Markov chains. The difference is the transition structure. The ratchet version reaches the absorbing state (success) much faster on average.
+
+## Why Memorylessness Matters
+
+The Poisson process is memoryless:
+
+```
+P(survive next t | already survived s) = P(survive t)
+```
+
+The process doesn't accumulate fatigue. Each moment is independent. This is why checkpointing is mathematically valid—we're not "cheating" by resetting the clock after each call. There's no hidden state we're ignoring.
+
+But even with memorylessness, **total exposure time still matters**. The probability of *at least one* failure over time *T* increases with *T*. Checkpointing doesn't change the hazard rate, but it reduces how much total time you need to finish the work.
+
+Think of it this way: if you need to cross a minefield, the memoryless model says each step has the same risk. But fewer total steps = fewer chances to hit a mine.
+
+## The Simulation
+
+We test this with 1,000 simulated runs per mode. The program is 10 calls, each taking 5 time units (50 total). We measure success rate, average time to completion, and number of attempts.
 
 ```typescript
 function checkFailure(
@@ -77,133 +162,115 @@ function checkFailure(
 }
 ```
 
-## Two Execution Modes
-
-The key insight is in how we handle `elapsedTime`:
-
-**Without checkpointing:** Time accumulates across the entire program. If calls take 5+5+5+5... units, the tenth call sees `elapsedTime = 45`. If that plus its duration exceeds the timeout, it fails—every time.
-
-**With checkpointing:** Each call starts fresh. `elapsedTime = 0` for every call. The timeout applies to each call individually, not the sum.
-
-On retry, the difference compounds:
+The executor tracks progress and resumes appropriately:
 
 ```typescript
-function runTest(
-  program: Program,
-  config: FailureConfig,
-  mode: ExecutionMode,
-  maxAttempts: number
-): TestResult {
-  let highWatermark = 0;  // Furthest call completed
+function runTest(program, config, mode, maxAttempts): TestResult {
+  let highWatermark = 0;  // Furthest call completed (our checkpoint)
 
   while (attempts < maxAttempts) {
-    // Without checkpoint: always start from 0
     // With checkpoint: resume from highWatermark
+    // Without: always start from 0
     const startIndex = mode === 'with-checkpoint' ? highWatermark : 0;
 
     const result = executeAttempt(program, startIndex, config, mode);
 
+    // Update checkpoint on progress
     if (result.callsCompleted > highWatermark) {
       highWatermark = result.callsCompleted;
     }
 
-    if (result.success) return { success: true, ... };
+    if (result.success) return success;
   }
 
-  return { success: false, ... };
+  return failure;
 }
 ```
 
 ## The Results
 
-We ran 1,000 simulated tests for each mode across three scenarios. The results are striking.
-
 ### Scenario 1: Transient Failures Only
 
-**Setup:** 10 calls × 5 time units each. Poisson rate λ=0.02. Generous timeout of 100 units.
+**Setup:** 10 calls × 5 units = 50 total. Poisson rate λ=0.02. Generous timeout (100 units).
 
 | Metric | No Checkpoint | With Checkpoint |
 |--------|---------------|-----------------|
 | Success Rate | 100% | 100% |
-| Avg Time | 91.02 units | 55.30 units |
+| Avg Total Time | 91.02 units | 55.30 units |
 | Avg Attempts | 2.76 | 2.06 |
 
-Both eventually succeed, but checkpointing is **39% faster**. When a failure occurs, we don't throw away completed work.
+Both eventually succeed. But checkpointing is **39% faster**. Less time redoing work = less total exposure.
 
-### Scenario 2: Tight Timeout (The Dramatic Case)
+### Scenario 2: Tight Timeout
 
-**Setup:** 10 calls × 5 time units = 50 total. Timeout of 40 units. No Poisson failures.
+**Setup:** Same program (50 units total). Timeout of 40 units. No Poisson failures.
 
 | Metric | No Checkpoint | With Checkpoint |
 |--------|---------------|-----------------|
 | Success Rate | **0%** | **100%** |
-| Avg Time | 4,500 units | 50 units |
+| Avg Total Time | 4,500 units | 50 units |
 | Avg Attempts | 100 (max) | 1 |
 
-Without checkpointing, this program is *impossible* to complete. The total duration (50) exceeds the timeout (40). Every attempt fails at the same point. Retry is futile.
+Without checkpointing, this program is **impossible**. Total duration (50) exceeds timeout (40). Every attempt fails at the same point.
 
-With checkpointing, each 5-unit call fits comfortably within the 40-unit timeout. The program completes on the first attempt, every time.
+With checkpointing, each 5-unit call easily fits within the 40-unit timeout. The program completes on the first attempt, every time.
 
 **Same program. Same work. 0% vs 100% success rate.**
 
-### Scenario 3: Combined (Real-World)
+### Scenario 3: Combined
 
-**Setup:** 10 calls × 5 units. Poisson rate λ=0.015. Timeout of 40 units.
+**Setup:** Poisson rate λ=0.015 + timeout of 40 units.
 
 | Metric | No Checkpoint | With Checkpoint |
 |--------|---------------|-----------------|
 | Success Rate | **0%** | **100%** |
-| Avg Time | 3,392 units | 54 units |
+| Avg Total Time | 3,392 units | 54 units |
 | Avg Attempts | 100 (max) | 1.80 |
 
-Real systems face both failure modes. The combined effect is devastating without checkpointing—and trivially handled with it.
+Real systems face both failure modes. The timeout makes non-checkpointed execution impossible. Checkpointing handles both gracefully.
 
-## The Deeper Insight
+## The Design Principle
 
-This isn't just about retry mechanics. It's about the *structure* of computation.
+This leads to a concrete principle:
 
-When you write a long-running function, you're implicitly making a bet: "The universe will leave me alone long enough to finish." The longer your function, the worse that bet becomes.
+> **Decompose work into atomic steps that individually fit within your system's constraints.**
 
-Checkpointing changes the bet. Instead of wagering on surviving the entire duration, you're wagering on surviving each step. And crucially, you get to keep your winnings between steps.
+Not because it's elegant. Because the math demands it:
 
-But there's a catch: **calls must be atomic**. If a single call exceeds the timeout, no amount of checkpointing saves you. The unit of work must fit within the constraint.
+1. **Each step must fit within the timeout.** If any single call exceeds the limit, no amount of retrying helps.
 
-This leads to a design principle:
+2. **Smaller steps = more frequent checkpoints = less work lost on failure.** The ratchet advances more often.
 
-> Decompose work into steps that are individually completable within your system's constraints.
+3. **Less total time to completion = less exposure to failure.** Even with memoryless failures, fewer total time units means fewer chances to crash.
 
-Not because it's elegant. Because the math demands it.
-
-## Running the Simulation Yourself
-
-Clone the repository and run:
+## Running It Yourself
 
 ```bash
+git clone <repo>
+cd retry-mechanics
 npm install
 npm run simulate
 ```
 
-You'll see all three scenarios with full statistics. The code is designed to be readable—explore `src/executor.ts` to see the checkpoint logic, and `src/failure.ts` for the probability model.
-
-Try modifying the scenarios:
-- What happens with more calls?
-- With tighter timeouts?
-- With higher failure rates?
+Experiment with the parameters:
+- More calls with shorter duration vs fewer calls with longer duration
+- Tighter timeouts
+- Higher failure rates
 
 The patterns hold. Checkpointing wins, and it wins bigger as conditions get harder.
 
 ## Conclusion
 
-Retry is not magic. It's a bet that failure was transient, not structural. Checkpointing improves the odds of that bet by:
+Retry is a bet that failure was transient. Checkpointing improves the odds:
 
-1. **Preserving progress:** Failed retries don't discard completed work
-2. **Resetting constraints:** Each step gets a fresh timeout budget
-3. **Enabling completion:** Work that exceeds global limits becomes possible when chunked
+1. **Less wasted work** — failed retries don't discard completed calls
+2. **Fresh timeout budget** — each call gets the full limit
+3. **Less total exposure** — faster completion = fewer chances to crash
 
-The simulation makes this visceral: same program, same work, but 0% success without checkpointing versus 100% with it.
+The simulation makes this visceral. Same program, same work, but execution strategy alone determines whether success is impossible (0%) or guaranteed (100%).
 
-The lesson isn't "always use checkpointing." It's that the *structure* of how you execute matters as much as *what* you execute. Understanding failure mechanics lets you design systems that don't just retry—they retry intelligently.
+The lesson: the *structure* of how you execute matters as much as *what* you execute. One process, constant danger, but checkpoints let you bank your progress and minimize your time in the minefield.
 
 ---
 
-*The full simulation code is available in TypeScript. Each component is tested and designed to be extended. Try it, break it, and see what else you can learn about the mechanics of retry.*
+*Full source code in TypeScript. Run the simulation, read the tests, modify the scenarios. See the math play out.*
